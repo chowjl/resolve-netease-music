@@ -1,5 +1,10 @@
 # 更新日志
 
+## [v1.1.1](https://github.com/chowjl/resolve-netease-music/releases/tag/v1.1.1) · 2026-11-09
+
+- 批量导入后原地更新歌曲状态，保留列表位置和多选。
+- 刷新同一个目录时保留原先位于列表顶部的曲目。曲目已移除时定位到附近仍在列表中的曲目。
+
 ## [v1.1.0](https://github.com/chowjl/resolve-netease-music/releases/tag/v1.1.0) · 2026-11-09
 
 - 安装时检查脚本目标路径和 FFmpeg 运行状态，并保存安装报告。面板可复制达芬奇和 Python 版本等诊断信息。

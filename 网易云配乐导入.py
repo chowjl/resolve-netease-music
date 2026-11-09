@@ -62,7 +62,7 @@ CODEX_FFMPEG = (
     Path.home() / ".codex" / "tools" / "whisper-venv" / "Lib" / "site-packages"
     / "imageio_ffmpeg" / "binaries" / "ffmpeg-win-x86_64-v7.1.exe"
 )
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.1.1"
 
 
 def current_project_id(resolve_app):
@@ -1515,8 +1515,25 @@ def show_panel(resolve_app, fusion_app, bmd_app):
             raise ValueError("下载目录不存在。请在网易云客户端设置中核对目录。")
         return folder.resolve()
 
-    def render_rows(_event=None):
+    def set_row_status(row, path):
+        row.Text[4] = " · ".join(
+            label for present, label in ((path in new_paths, "新下载"), (path in imported_paths, "已导入"))
+            if present
+        )
+
+    def render_rows(_event=None, *, keep_scroll=False):
         sync_candidates()
+        previous_paths = [path for _, path in rows] if keep_scroll else []
+        anchor_index = None
+        if previous_paths:
+            try:
+                first = tree.ItemAt([2, 0])
+                if first:
+                    index = tree.IndexOfTopLevelItem(first)
+                    if 0 <= index < len(previous_paths):
+                        anchor_index = index
+            except (AttributeError, RuntimeError, TypeError):
+                pass
         selected = {path for row, path in rows if row.Selected}
         rows.clear()
         tree.Clear()
@@ -1543,10 +1560,7 @@ def show_panel(resolve_app, fusion_app, bmd_app):
             row.ToolTip[1] = "点击星标，加入或移出当前项目候选歌单"
             row.Text[2] = modified.strftime("%Y-%m-%d %H:%M:%S")
             row.Text[3] = format_time(durations.get(key))
-            row.Text[4] = " · ".join(
-                label for present, label in ((path in new_paths, "新下载"), (path in imported_paths, "已导入"))
-                if present
-            )
+            set_row_status(row, path)
             row.Text[5] = path.name
             row.TextColor[5] = date_color
             tree.AddTopLevelItem(row)
@@ -1556,6 +1570,16 @@ def show_panel(resolve_app, fusion_app, bmd_app):
             if key not in pending and key not in durations:
                 pending.add(key)
                 duration_jobs.put(key)
+        if anchor_index is not None and rows:
+            current_rows = {path: row for row, path in rows}
+            neighbors = previous_paths[anchor_index:] + previous_paths[:anchor_index][::-1]
+            anchor = next((current_rows[path] for path in neighbors if path in current_rows), None)
+            if anchor is None:
+                anchor = rows[min(anchor_index, len(rows) - 1)][0]
+            # Resolve exposes EnsureVisible. Approaching from the end puts the
+            # anchor at the top, except where the list ends sooner.
+            tree.ScrollToItem(rows[-1][0])
+            tree.ScrollToItem(anchor)
         items["Import"].Enabled = bool(rows)
         status("显示 {} / {} 首，本次新下载 {} 首。".format(len(rows), len(found), len(new_paths)))
 
@@ -1574,7 +1598,8 @@ def show_panel(resolve_app, fusion_app, bmd_app):
             status(str(exc))
             return
         stamps = {path: stamp for stamp, path in found}
-        if folder != listed_folder:
+        same_folder = folder == listed_folder
+        if not same_folder:
             if listed_folder is not None:
                 stop_playback()
             baseline = stamps.copy()
@@ -1584,7 +1609,7 @@ def show_panel(resolve_app, fusion_app, bmd_app):
             imported_paths = imported_sources(resolve_app, found)
         except (AttributeError, RuntimeError, TypeError):
             imported_paths = set()
-        render_rows()
+        render_rows(keep_scroll=same_folder)
         try:
             SETTINGS.parent.mkdir(parents=True, exist_ok=True)
             SETTINGS.write_text(str(listed_folder), encoding="utf-8")
@@ -1971,7 +1996,7 @@ def show_panel(resolve_app, fusion_app, bmd_app):
 
     def import_selected(_event):
         try:
-            selected = [path for row, path in rows if row.Selected]
+            selected = [(row, path) for row, path in rows if row.Selected]
             if not selected:
                 status("请先在列表中选中要导入的配乐。")
                 return
@@ -1989,7 +2014,7 @@ def show_panel(resolve_app, fusion_app, bmd_app):
         first_failure = None
         failures = []
         destination = None
-        for source in selected:
+        for _, source in selected:
             try:
                 if not source.is_file() or not source.stat().st_size:
                     raise RuntimeError("音频文件不可用，请刷新列表。")
@@ -2016,7 +2041,8 @@ def show_panel(resolve_app, fusion_app, bmd_app):
         if failures:
             message += "\n首个错误 · " + first_failure
             record_errors(failures)
-        render_rows()
+        for row, source in selected:
+            set_row_status(row, source)
         status(message)
 
     def record_errors(errors):

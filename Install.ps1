@@ -9,7 +9,7 @@ $ffmpegVersion = 'Not checked'
 
 function Write-InstallReport($result) {
     $report = @(
-        'Resolve NetEase Music 1.1.0',
+        'Resolve NetEase Music 1.1.1',
         "Result: $result",
         "Script target: $installedScript",
         "FFmpeg path: $checkedFfmpeg",
