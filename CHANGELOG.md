@@ -1,5 +1,10 @@
 # 更新日志
 
+## [v1.1.0](https://github.com/chowjl/resolve-netease-music/releases/tag/v1.1.0) · 2026-11-09
+
+- 安装时检查脚本目标路径和 FFmpeg 运行状态，并保存安装报告。面板可复制达芬奇和 Python 版本等诊断信息。
+- 新增按项目保存的候选星标和「仅看候选」筛选。重新试听时恢复曲目的播放位置和 A/B 选段。
+
 ## [v1.0.6](https://github.com/chowjl/resolve-netease-music/releases/tag/v1.0.6) · 2026-11-09
 
 - 安装程序支持读取同目录下的 FFmpeg ZIP。可在目标电脑上离线完成安装，避开下载超时或 504。

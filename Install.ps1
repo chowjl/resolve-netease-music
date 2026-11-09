@@ -1,12 +1,43 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$settings = Join-Path $env:APPDATA 'ResolveNetEaseMusic'
+$reportPath = Join-Path $settings 'install-report.txt'
+$menu = Join-Path $env:APPDATA 'Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility'
+$installedScript = $menu
+$checkedFfmpeg = 'Not checked'
+$ffmpegVersion = 'Not checked'
+
+function Write-InstallReport($result) {
+    $report = @(
+        'Resolve NetEase Music 1.1.0',
+        "Result: $result",
+        "Script target: $installedScript",
+        "FFmpeg path: $checkedFfmpeg",
+        "FFmpeg check: $ffmpegVersion",
+        'For Resolve and Python versions, open the panel and click Copy Diagnostics.'
+    )
+    $report | ForEach-Object { Write-Host $_ }
+    try {
+        New-Item -ItemType Directory -Path $settings -Force | Out-Null
+        Set-Content -LiteralPath $reportPath -Value $report -Encoding UTF8
+        Write-Host "Report: $reportPath"
+    } catch {
+        Write-Host "Could not save the report: $($_.Exception.Message)"
+    }
+}
+
+trap {
+    Write-InstallReport "Failed. $($_.Exception.Message)"
+    exit 1
+}
 
 $source = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.py' -File)
 if ($source.Count -ne 1) {
     throw 'Keep Install.ps1 in the same folder as the Resolve Python script.'
 }
+$installedScript = Join-Path $menu $source[0].Name
 
-$bin = Join-Path $env:APPDATA 'ResolveNetEaseMusic\bin'
+$bin = Join-Path $settings 'bin'
 $ffmpeg = Join-Path $bin 'ffmpeg.exe'
 if (!(Test-Path -LiteralPath $ffmpeg -PathType Leaf) -and
     !(Get-Command ffmpeg.exe -CommandType Application -ErrorAction SilentlyContinue)) {
@@ -58,7 +89,41 @@ if (!(Test-Path -LiteralPath $ffmpeg -PathType Leaf) -and
     }
 }
 
-$menu = Join-Path $env:APPDATA 'Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility'
+if (Test-Path -LiteralPath $ffmpeg -PathType Leaf) {
+    $checkedFfmpeg = $ffmpeg
+} else {
+    $checkedFfmpeg = (Get-Command ffmpeg.exe -CommandType Application).Source
+}
+$process = New-Object System.Diagnostics.Process
+$ffmpegVersion = 'Failed'
+try {
+    $process.StartInfo.FileName = $checkedFfmpeg
+    $process.StartInfo.Arguments = '-version'
+    $process.StartInfo.UseShellExecute = $false
+    $process.StartInfo.CreateNoWindow = $true
+    $process.StartInfo.RedirectStandardOutput = $true
+    $process.StartInfo.RedirectStandardError = $true
+    [void]$process.Start()
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    if (!$process.WaitForExit(8000)) {
+        $process.Kill()
+        throw 'FFmpeg did not respond within 8 seconds.'
+    }
+    if ($process.ExitCode -ne 0) {
+        $reason = ($stderr.GetAwaiter().GetResult() -split '\r?\n')[0]
+        throw "FFmpeg could not run (exit $($process.ExitCode)). $reason"
+    }
+    $ffmpegVersion = ($stdout.GetAwaiter().GetResult() -split '\r?\n')[0]
+    if (!$ffmpegVersion) { throw 'FFmpeg returned no version information.' }
+} finally {
+    $process.Dispose()
+}
+
 New-Item -ItemType Directory -Path $menu -Force | Out-Null
-Copy-Item -LiteralPath $source[0].FullName -Destination $menu -Force
+Copy-Item -LiteralPath $source[0].FullName -Destination $installedScript -Force
+if (!(Test-Path -LiteralPath $installedScript -PathType Leaf)) {
+    throw 'The script was not found in the target directory after copying.'
+}
+Write-InstallReport 'Installed'
 Write-Host 'Installed. Restart Resolve if the menu entry is not visible.'

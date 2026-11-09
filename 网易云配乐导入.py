@@ -7,8 +7,10 @@ import math
 import os
 import re
 import shutil
+import sqlite3
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import traceback
@@ -16,6 +18,7 @@ import wave
 import winreg
 import zlib
 from array import array
+from contextlib import closing as close_connection
 from ctypes import wintypes
 from datetime import datetime
 from itertools import cycle
@@ -59,6 +62,83 @@ CODEX_FFMPEG = (
     Path.home() / ".codex" / "tools" / "whisper-venv" / "Lib" / "site-packages"
     / "imageio_ffmpeg" / "binaries" / "ffmpeg-win-x86_64-v7.1.exe"
 )
+PLUGIN_VERSION = "1.1.0"
+
+
+def current_project_id(resolve_app):
+    try:
+        project = resolve_app.GetProjectManager().GetCurrentProject()
+        return (project.GetUniqueId() or None) if project else None
+    except (AttributeError, RuntimeError, TypeError):
+        return None
+
+
+class CandidateStore:
+    def __init__(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        with close_connection(self.connect()) as db, db:
+            db.execute("""CREATE TABLE IF NOT EXISTS tracks (
+                project TEXT NOT NULL, path TEXT NOT NULL,
+                favorite INTEGER NOT NULL DEFAULT 0,
+                stamp INTEGER, position INTEGER, start INTEGER, end INTEGER,
+                PRIMARY KEY (project, path)
+            )""")
+
+    def connect(self):
+        return sqlite3.connect(self.path, timeout=1)
+
+    def favorites(self, project):
+        with close_connection(self.connect()) as db:
+            return {path for path, in db.execute(
+                "SELECT path FROM tracks WHERE project = ? AND favorite = 1", (project,)
+            )}
+
+    def set_favorite(self, project, path, favorite):
+        with close_connection(self.connect()) as db, db:
+            db.execute("""INSERT INTO tracks (project, path, favorite) VALUES (?, ?, ?)
+                ON CONFLICT (project, path) DO UPDATE SET favorite = excluded.favorite""",
+                (project, path, favorite))
+
+    def resume(self, project, path, stamp):
+        with close_connection(self.connect()) as db:
+            return db.execute("""SELECT position, start, end FROM tracks
+                WHERE project = ? AND path = ? AND stamp = ?""", (project, path, stamp)).fetchone()
+
+    def save_resume(self, project, path, stamp, position, markers):
+        with close_connection(self.connect()) as db, db:
+            db.execute("""INSERT INTO tracks (project, path, stamp, position, start, end)
+                VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (project, path) DO UPDATE SET
+                stamp = excluded.stamp, position = excluded.position,
+                start = excluded.start, end = excluded.end""",
+                (project, path, stamp, position, *markers))
+
+
+def diagnostic_report(resolve_app, script_path):
+    ffmpeg = find_ffmpeg()
+    if ffmpeg:
+        try:
+            result = subprocess.run(
+                [ffmpeg, "-version"], capture_output=True, timeout=5, check=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            version = result.stdout.decode("utf-8", errors="replace").splitlines()
+            ffmpeg_status = version[0] if version else "运行成功"
+        except (OSError, subprocess.SubprocessError) as exc:
+            ffmpeg_status = "运行失败 · {}".format(exc)
+    else:
+        ffmpeg_status = "未找到"
+    return "\n".join((
+        "网易云配乐导入 {}".format(PLUGIN_VERSION),
+        "达芬奇 · {} {}".format(resolve_app.GetProductName(), resolve_app.GetVersionString()),
+        "Python · {} · {} 位{}".format(
+            sys.version.split()[0], ctypes.sizeof(ctypes.c_void_p) * 8,
+            " · 需要 Python 3.12 或更新版本" if sys.version_info < (3, 12) else "",
+        ),
+        "脚本路径 · {}".format(script_path),
+        "FFmpeg 路径 · {}".format(ffmpeg or "未找到"),
+        "FFmpeg 检查 · {}".format(ffmpeg_status),
+    )) + "\n"
 
 
 def read_folder_setting(path, default=""):
@@ -589,9 +669,9 @@ class AudioPreview:
             self.stop()
             raise
 
-    def start_prepared(self):
+    def start_prepared(self, position=0):
         self.open_wav(self.active_audio)
-        self.start_at(0)
+        return self.start_at(position if 0 <= position < self.duration else 0)
 
     def position(self):
         return int(self.command("status {} position".format(self.alias)))
@@ -949,10 +1029,14 @@ def show_panel(resolve_app, fusion_app, bmd_app):
                         "MinimumSize": [300, 32], "Events": {"TextChanged": True},
                     }),
                     ui.CheckBox({"ID": "NewOnly", "Text": "仅看本次新下载", "Weight": 0, "Events": {"Toggled": True}}),
+                    ui.CheckBox({"ID": "FavoritesOnly", "Text": "仅看候选", "Weight": 0, "Events": {"Toggled": True}}),
                 ])),
-                aligned(ui.Label({"ID": "Status", "Text": "", "WordWrap": True, "MinimumSize": [0, 44]})),
+                aligned(ui.HGroup({"Spacing": 12}, [
+                    ui.Label({"ID": "Status", "Text": "", "WordWrap": True, "MinimumSize": [0, 44]}),
+                    ui.Button({"ID": "Diagnostics", "Text": "复制诊断", "FixedSize": [96, 32], "Weight": 0}),
+                ])),
                 aligned(ui.Tree({
-                    "ID": "Files", "ColumnCount": 5, "SelectionMode": "ExtendedSelection",
+                    "ID": "Files", "ColumnCount": 6, "SelectionMode": "ExtendedSelection",
                     "SortingEnabled": False, "RootIsDecorated": False,
                     "AlternatingRowColors": True, "MinimumSize": [460, 96], "StyleSheet": tree_style,
                     "Events": {"ItemClicked": True, "ItemDoubleClicked": True},
@@ -1040,15 +1124,17 @@ def show_panel(resolve_app, fusion_app, bmd_app):
     tree = items["Files"]
     header = tree.NewItem()
     header.Text[0] = "排名"
-    header.Text[1] = "修改时间（最新在前）"
-    header.Text[2] = "时长"
-    header.Text[3] = "状态"
-    header.Text[4] = "文件名"
+    header.Text[1] = "候选"
+    header.Text[2] = "修改时间（最新在前）"
+    header.Text[3] = "时长"
+    header.Text[4] = "状态"
+    header.Text[5] = "文件名"
     tree.SetHeaderItem(header)
     tree.ColumnWidth[0] = 62
-    tree.ColumnWidth[1] = 172
-    tree.ColumnWidth[2] = 62
-    tree.ColumnWidth[3] = 106
+    tree.ColumnWidth[1] = 56
+    tree.ColumnWidth[2] = 172
+    tree.ColumnWidth[3] = 62
+    tree.ColumnWidth[4] = 106
     rows = []
     listed_folder = None
     found = []
@@ -1064,6 +1150,13 @@ def show_panel(resolve_app, fusion_app, bmd_app):
     duration_ffmpeg = find_ffmpeg()
     markers = [None, None]
     preview = AudioPreview()
+    try:
+        candidates = CandidateStore(SETTINGS.with_name("candidates.sqlite3"))
+    except (OSError, sqlite3.Error):
+        candidates = None
+    candidate_project = None
+    favorite_paths = set()
+    preview_project = None
 
     loading_source = None
     seek = items["Seek"]
@@ -1083,6 +1176,50 @@ def show_panel(resolve_app, fusion_app, bmd_app):
 
     def status(message):
         items["Status"].Text = message
+
+    def copy_diagnostics(_event):
+        path = SETTINGS.with_name("diagnostics.txt")
+        try:
+            report = diagnostic_report(resolve_app, globals().get("__file__", "脚本宿主未提供"))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(report, encoding="utf-8")
+        except (AttributeError, OSError, RuntimeError) as exc:
+            status("无法生成诊断报告 · {}".format(exc))
+            return
+        try:
+            clip = Path(os.environ["SystemRoot"]) / "System32" / "clip.exe"
+            subprocess.run([str(clip)], input=report.encode("utf-16"), timeout=5, check=True,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+        except (OSError, subprocess.SubprocessError):
+            status("诊断报告已保存 · {}".format(path))
+        else:
+            status("诊断报告已复制，可以直接粘贴发送。")
+
+    def sync_candidates(reload=False):
+        nonlocal candidate_project, favorite_paths
+        project = current_project_id(resolve_app)
+        if reload or project != candidate_project:
+            try:
+                favorite_paths = candidates.favorites(project) if candidates and project else set()
+            except sqlite3.Error:
+                if project != candidate_project:
+                    favorite_paths = set()
+                items["FavoritesOnly"].Enabled = False
+                return
+            candidate_project = project
+        items["FavoritesOnly"].Enabled = bool(candidates and project)
+
+    def save_preview_progress():
+        if not (candidates and preview_project and preview.opened and preview.source_signature):
+            return
+        try:
+            position = min(preview.position(), preview.duration)
+            candidates.save_resume(
+                preview_project, os.path.normcase(str(preview.source)), preview.source_signature[1],
+                position if position < preview.duration else 0, markers,
+            )
+        except (OSError, RuntimeError, sqlite3.Error) as exc:
+            status("无法保存试听进度 · {}".format(exc))
 
     def display_time(position, scrubbing=False):
         nonlocal displayed_time
@@ -1147,7 +1284,7 @@ def show_panel(resolve_app, fusion_app, bmd_app):
         if changed:
             for row, path in rows:
                 if path in changed:
-                    row.Text[2] = format_time(durations[(path, stamps[path])])
+                    row.Text[3] = format_time(durations[(path, stamps[path])])
 
     def display_position(position):
         nonlocal displayed_position
@@ -1180,7 +1317,9 @@ def show_panel(resolve_app, fusion_app, bmd_app):
         items["PreviewTrack"].ToolTip = ""
 
     def stop_playback():
-        nonlocal loading_source
+        nonlocal loading_source, preview_project
+        save_preview_progress()
+        preview_project = None
         loading_source = None
         reset_preview_display()
         preview.stop()
@@ -1218,6 +1357,7 @@ def show_panel(resolve_app, fusion_app, bmd_app):
             position = preview.seek(position)
             display_position(position)
             update_player_state()
+            save_preview_progress()
         except (OSError, RuntimeError) as exc:
             status("无法跳转试听位置 · {}".format(exc))
 
@@ -1258,6 +1398,8 @@ def show_panel(resolve_app, fusion_app, bmd_app):
                 preview.toggle()
                 display_position(preview.position())
                 update_player_state()
+                if not preview.playing:
+                    save_preview_progress()
         except (OSError, RuntimeError) as exc:
             status("无法暂停或继续试听 · {}".format(exc))
 
@@ -1374,11 +1516,13 @@ def show_panel(resolve_app, fusion_app, bmd_app):
         return folder.resolve()
 
     def render_rows(_event=None):
+        sync_candidates()
         selected = {path for row, path in rows if row.Selected}
         rows.clear()
         tree.Clear()
         keywords = items["Search"].Text.casefold().split()
         new_only = items["NewOnly"].Checked
+        favorites_only = items["FavoritesOnly"].Enabled and items["FavoritesOnly"].Checked
         palette = cycle(DATE_COLORS)
         previous_date = None
         for rank, (modified_ns, path) in enumerate(found, start=1):
@@ -1388,19 +1532,23 @@ def show_panel(resolve_app, fusion_app, bmd_app):
                 red, green, blue = next(palette)
                 date_color = {"R": red, "G": green, "B": blue, "A": 1.0}
                 previous_date = date
-            if (new_only and path not in new_paths) or any(word not in path.name.casefold() for word in keywords):
+            favorite = os.path.normcase(str(path)) in favorite_paths
+            if ((new_only and path not in new_paths) or (favorites_only and not favorite)
+                    or any(word not in path.name.casefold() for word in keywords)):
                 continue
             key = (path, modified_ns)
             row = tree.NewItem()
             row.Text[0] = str(rank)
-            row.Text[1] = modified.strftime("%Y-%m-%d %H:%M:%S")
-            row.Text[2] = format_time(durations.get(key))
-            row.Text[3] = " · ".join(
+            row.Text[1] = "★" if favorite else "☆"
+            row.ToolTip[1] = "点击星标，加入或移出当前项目候选歌单"
+            row.Text[2] = modified.strftime("%Y-%m-%d %H:%M:%S")
+            row.Text[3] = format_time(durations.get(key))
+            row.Text[4] = " · ".join(
                 label for present, label in ((path in new_paths, "新下载"), (path in imported_paths, "已导入"))
                 if present
             )
-            row.Text[4] = path.name
-            row.TextColor[4] = date_color
+            row.Text[5] = path.name
+            row.TextColor[5] = date_color
             tree.AddTopLevelItem(row)
             if path in selected:
                 row.Selected = True
@@ -1413,6 +1561,10 @@ def show_panel(resolve_app, fusion_app, bmd_app):
 
     def refresh(_event=None):
         nonlocal listed_folder, found, baseline, new_paths, imported_paths, stamps
+        sync_candidates(reload=True)
+        if sys.version_info < (3, 12):
+            status("当前 Python 版本低于 3.12。点「复制诊断」查看详情。")
+            return
         try:
             folder = selected_folder()
             found = scan_audio(folder)
@@ -1556,7 +1708,7 @@ def show_panel(resolve_app, fusion_app, bmd_app):
             waveform_needs_resize = True
 
     def preview_source(source):
-        nonlocal loading_source
+        nonlocal loading_source, preview_project
         if loading_source is not None:
             return
         try:
@@ -1576,7 +1728,15 @@ def show_panel(resolve_app, fusion_app, bmd_app):
             preview.volume = int(items["Volume"].Value)
             # Start from the user's UI event, independent of queued callbacks.
             preview.prepare(source)
-            preview.start_prepared()
+            project = current_project_id(resolve_app)
+            saved = None
+            if candidates and project:
+                try:
+                    saved = candidates.resume(project, os.path.normcase(str(source)), preview.source_signature[1])
+                except sqlite3.Error:
+                    pass
+            position = preview.start_prepared(saved[0] if saved else 0)
+            preview_project = project
             loading_source = None
             show_idle_frame()
             player_resized(None)
@@ -1586,7 +1746,7 @@ def show_panel(resolve_app, fusion_app, bmd_app):
                 durations[(source, stamp)] = preview.duration
             for row, path in rows:
                 if path == source:
-                    row.Text[2] = format_time(preview.duration)
+                    row.Text[3] = format_time(preview.duration)
                     break
             seek.Maximum = preview.duration
             seek.Enabled = True
@@ -1596,8 +1756,11 @@ def show_panel(resolve_app, fusion_app, bmd_app):
             items["Back5"].Enabled = True
             items["Ahead5"].Enabled = True
             set_track_title(source)
-            display_position(0)
-            update_player_state()
+            display_position(position)
+            if saved:
+                markers[:] = [point if point is not None and 0 <= point <= preview.duration else None
+                              for point in saved[1:]]
+            update_markers()
             status("可直接点击或拖动定位。需要看波形时点「加载波形」。")
         except Exception as exc:
             stop_playback()
@@ -1628,11 +1791,43 @@ def show_panel(resolve_app, fusion_app, bmd_app):
         preview_source(source)
 
     def preview_double_clicked(event):
+        if event.get("column", event.get("Column")) in (1, "1"):
+            return
         rank = event["item"].Text[0]
         for row, path in rows:
             if row.Text[0] == rank:
                 preview_source(path)
                 return
+
+    def file_clicked(event):
+        focus_preview_panel()
+        if event.get("column", event.get("Column")) not in (1, "1"):
+            return
+        previous_project = candidate_project
+        sync_candidates()
+        if not items["FavoritesOnly"].Enabled:
+            status("候选歌单不可用。请确认已打开项目，并检查脚本设置目录。")
+            return
+        rank = event["item"].Text[0]
+        for row, path in rows:
+            if row.Text[0] != rank:
+                continue
+            key = os.path.normcase(str(path))
+            favorite = key not in favorite_paths
+            try:
+                candidates.set_favorite(candidate_project, key, favorite)
+            except sqlite3.Error as exc:
+                status("无法保存候选歌单 · {}".format(exc))
+                return
+            if favorite:
+                favorite_paths.add(key)
+            else:
+                favorite_paths.discard(key)
+            if items["FavoritesOnly"].Checked or candidate_project != previous_project:
+                render_rows()
+            else:
+                row.Text[1] = "★" if favorite else "☆"
+            return
 
     def move_track(direction):
         if not rows:
@@ -1726,6 +1921,7 @@ def show_panel(resolve_app, fusion_app, bmd_app):
                 return
             markers[index] = point
             update_markers()
+            save_preview_progress()
         except (OSError, RuntimeError) as exc:
             status("无法标记片段 · {}".format(exc))
 
@@ -1733,6 +1929,7 @@ def show_panel(resolve_app, fusion_app, bmd_app):
         if preview.opened:
             markers[:] = [None, None]
             update_markers()
+            save_preview_progress()
 
     def loop_toggled(_event):
         limits = selected_range() if items["LoopAB"].Checked else None
@@ -1836,6 +2033,7 @@ def show_panel(resolve_app, fusion_app, bmd_app):
             return
         closing = True
         try:
+            save_preview_progress()
             window.Hide()
         finally:
             dispatcher.ExitLoop()
@@ -1851,7 +2049,7 @@ def show_panel(resolve_app, fusion_app, bmd_app):
     window.On["Import"].Clicked = import_selected
     window.On["Preview"].Clicked = preview_selected
     window.On["LoadWaveform"].Clicked = load_waveform
-    window.On["Files"].ItemClicked = focus_preview_panel
+    window.On["Files"].ItemClicked = file_clicked
     window.On["Files"].ItemDoubleClicked = preview_double_clicked
     window.On["PausePreview"].Clicked = toggle_preview
     window.On["StopPreview"].Clicked = stop_preview
@@ -1866,6 +2064,8 @@ def show_panel(resolve_app, fusion_app, bmd_app):
     window.On["Next"].Clicked = lambda _event: move_track(1)
     window.On["Search"].TextChanged = render_rows
     window.On["NewOnly"].Toggled = render_rows
+    window.On["FavoritesOnly"].Toggled = render_rows
+    window.On["Diagnostics"].Clicked = copy_diagnostics
     window.On["Volume"].ValueChanged = volume_changed
     window.On["SetA"].Clicked = lambda _event: set_marker(0)
     window.On["SetB"].Clicked = lambda _event: set_marker(1)
@@ -1887,6 +2087,8 @@ def show_panel(resolve_app, fusion_app, bmd_app):
         clock_worker.start()
         dispatcher.RunLoop()
     finally:
+        if not closing:
+            save_preview_progress()
         closing = True
         if remove_shortcut is not None:
             remove_shortcut()
