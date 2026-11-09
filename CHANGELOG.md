@@ -1,5 +1,10 @@
 # 更新日志
 
+## [v1.0.5](https://github.com/chowjl/resolve-netease-music/releases/tag/v1.0.5) · 2026-11-09
+
+- 双击歌曲时直接解码并启动试听，避免后台完成通知丢失后一直显示「准备中」。
+- 试听用的 FFmpeg 解码超时时会显示错误提示。
+
 ## [v1.0.4](https://github.com/chowjl/resolve-netease-music/releases/tag/v1.0.4) · 2026-11-09
 
 - 双击歌曲试听时，后台解码完成后直接通知播放器启动。进度刷新也可以接收结果，避免界面长时间停在「准备中」。

@@ -16,13 +16,12 @@ import wave
 import winreg
 import zlib
 from array import array
-from concurrent.futures import CancelledError
 from ctypes import wintypes
 from datetime import datetime
 from itertools import cycle
 from pathlib import Path
 from queue import Empty, Queue
-from threading import Condition, Event, Thread, current_thread
+from threading import Event, Thread, current_thread
 from uuid import uuid4
 
 
@@ -33,6 +32,7 @@ PLAYHEAD_WIDTH = 30
 CONTENT_EDGE = 6
 WAVEFORM_ROW_HEIGHT = 88
 WAVEFORM_GROOVE_HEIGHT = 66
+PREVIEW_TIMEOUT = 20
 # Rasterized “准备中…” alpha mask, 62 × 17. No extra runtime font or image library.
 PREPARING_MASK = (
     "eNqdkl1EQ3EYxl91oqJI2U1Ml8fMjBLRxWIRKytF3SW66MNsEqXdRER0ebYuOrFyRuqiETX6IJok0uyi"
@@ -149,7 +149,7 @@ def decrypt_ncm_key(encrypted, secret=b"hzHRAmso5kInbaxW", prefix=b"neteasecloud
     return decoded[len(prefix):]
 
 
-def extract_ncm_audio(source, work, file_size, cancelled=None):
+def extract_ncm_audio(source, work, file_size):
     # Container layout reference: taurusxin/ncmdump, src/ncmcrypt.cpp.
     with source.open("rb") as stream:
         def read_exact(length):
@@ -203,8 +203,6 @@ def extract_ncm_audio(source, work, file_size, cancelled=None):
         with output.open("wb") as handle:
             handle.write(audio)
             while True:
-                if cancelled is not None and cancelled.is_set():
-                    raise CancelledError()
                 block = stream.read(len(block_mask))
                 if not block:
                     break
@@ -515,33 +513,14 @@ def draw_waveform(peaks, image, markers=(None, None), duration=0, width=None, pr
     )
 
 
-def run_preview_ffmpeg(command, timeout, cancelled=None):
-    if cancelled is None:
-        subprocess.run(command, capture_output=True, timeout=timeout, check=True,
-                       creationflags=subprocess.CREATE_NO_WINDOW)
-        return
-    if cancelled.is_set():
-        raise CancelledError()
-    with subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                          creationflags=subprocess.CREATE_NO_WINDOW) as process:
-        deadline = time.monotonic() + timeout
-        try:
-            while not cancelled.is_set():
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise subprocess.TimeoutExpired(command, timeout)
-                try:
-                    _, errors = process.communicate(timeout=min(0.1, remaining))
-                except subprocess.TimeoutExpired:
-                    continue
-                if process.returncode:
-                    raise subprocess.CalledProcessError(process.returncode, command, stderr=errors)
-                return
-            raise CancelledError()
-        finally:
-            if process.poll() is None:
-                process.kill()
-                process.communicate()
+def run_preview_ffmpeg(command, timeout):
+    try:
+        subprocess.run(
+            command, capture_output=True, timeout=timeout, check=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("试听解码超时，请重试或换一首。") from exc
 
 
 class AudioPreview:
@@ -576,14 +555,13 @@ class AudioPreview:
             self.temp = tempfile.TemporaryDirectory(prefix="ncm-")
         return Path(self.temp.name)
 
-    def prepare(self, source, cancelled):
+    def prepare(self, source):
         try:
-            if cancelled.is_set():
-                raise CancelledError()
+            deadline = time.monotonic() + PREVIEW_TIMEOUT
             info = source.stat()
             audio = source
             if source.suffix.lower() == ".ncm":
-                audio = extract_ncm_audio(source, self.workspace(), info.st_size, cancelled)
+                audio = extract_ncm_audio(source, self.workspace(), info.st_size)
             ffmpeg = find_ffmpeg()
             wav = self.workspace() / "p.wav"
             if ffmpeg:
@@ -591,7 +569,7 @@ class AudioPreview:
                     run_preview_ffmpeg(
                         [ffmpeg, "-nostdin", "-v", "error", "-xerror", "-i", str(audio),
                          "-map", "0:a:0", "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", str(wav)],
-                        90, cancelled,
+                        max(0.1, deadline - time.monotonic()),
                     )
                 except (subprocess.SubprocessError, OSError) as exc:
                     raise RuntimeError("无法解码试听音频。{}".format(exc)) from exc
@@ -606,7 +584,7 @@ class AudioPreview:
             self.source = source
             self.source_signature = (after.st_size, after.st_mtime_ns)
             self.base_audio = wav
-            self.active_audio = self.volume_audio(self.volume, cancelled)
+            self.active_audio = self.volume_audio(self.volume, max(0.1, deadline - time.monotonic()))
         except Exception:
             self.stop()
             raise
@@ -633,7 +611,7 @@ class AudioPreview:
             draw_waveform(self.peaks, image, markers, self.duration, width)
         return image
 
-    def volume_audio(self, volume, cancelled=None):
+    def volume_audio(self, volume, timeout=30):
         if volume == 100:
             return self.base_audio
         ffmpeg = find_ffmpeg()
@@ -643,7 +621,7 @@ class AudioPreview:
         run_preview_ffmpeg(
             [ffmpeg, "-nostdin", "-v", "error", "-y", "-i", str(self.base_audio),
              "-af", "volume={}".format(volume / 100), "-c:a", "pcm_s16le", str(wav)],
-            30, cancelled,
+            timeout,
         )
         return wav
 
@@ -716,71 +694,6 @@ class AudioPreview:
         if self.temp is not None:
             self.temp.cleanup()
             self.temp = None
-
-
-class PreviewLoader:
-    def __init__(self, on_ready):
-        self.on_ready = on_ready
-        self.condition = Condition()
-        self.pending = self.result = self.latest = None
-        self.closed = False
-        self.worker = Thread(target=self.run, name="NetEasePreviewLoader", daemon=True)
-
-    def request(self, source, volume):
-        self.cancel()
-        with self.condition:
-            self.latest = Event()
-            self.pending = (source, volume, self.latest)
-            self.condition.notify()
-
-    def cancel(self):
-        with self.condition:
-            if self.latest is not None:
-                self.latest.set()
-            self.pending = None
-            result = self.result
-            self.result = None
-        if result is not None:
-            result[0].stop()
-
-    def poll(self):
-        with self.condition:
-            result = self.result
-            self.result = None
-            return result
-
-    def close(self):
-        try:
-            self.cancel()
-        finally:
-            with self.condition:
-                self.closed = True
-                self.condition.notify()
-
-    def run(self):
-        while True:
-            with self.condition:
-                self.condition.wait_for(lambda: self.closed or self.pending is not None)
-                if self.closed:
-                    return
-                source, volume, cancelled = self.pending
-                self.pending = None
-
-            prepared = AudioPreview()
-            prepared.volume = volume
-            error = None
-            try:
-                prepared.prepare(source, cancelled)
-            except Exception as exc:
-                error = str(exc)
-            with self.condition:
-                accepted = not self.closed and not cancelled.is_set()
-                if accepted:
-                    self.result = (prepared, error)
-            if accepted:
-                self.on_ready()
-            else:
-                prepared.stop()
 
 
 def save_preview_segment(preview, markers, output):
@@ -1116,7 +1029,6 @@ def show_panel(resolve_app, fusion_app, bmd_app):
                 ])),
                 ui.VGap(12, 0),
                 ui.Button({"ID": "ClockPulse", "Hidden": True, "Events": {"Clicked": True}}),
-                ui.Button({"ID": "PreviewReady", "Hidden": True, "Events": {"Clicked": True}}),
             ]),
             ui.Label({
                 "ID": "RightGutter", "Text": "", "MinimumSize": [44, 1],
@@ -1153,16 +1065,6 @@ def show_panel(resolve_app, fusion_app, bmd_app):
     markers = [None, None]
     preview = AudioPreview()
 
-    def queue_preview_ready():
-        if end_worker.is_set():
-            return
-        try:
-            ui.QueueEvent(items["PreviewReady"], "Clicked", {})
-        except Exception:
-            # The playback clock can still pick up the completed result.
-            pass
-
-    loader = PreviewLoader(queue_preview_ready)
     loading_source = None
     seek = items["Seek"]
     displayed_position = 0
@@ -1177,7 +1079,6 @@ def show_panel(resolve_app, fusion_app, bmd_app):
     panel_hwnd = None
     space_allowed = Event()
     space_requests = Queue()
-    last_clock = 0.0
     clock_pending = Event()
 
     def status(message):
@@ -1281,18 +1182,10 @@ def show_panel(resolve_app, fusion_app, bmd_app):
     def stop_playback():
         nonlocal loading_source
         loading_source = None
-        loader.cancel()
         reset_preview_display()
         preview.stop()
         display_time(0)
         update_player_state()
-
-    def preview_ready(_event=None):
-        if closing or current_thread() is loader.worker:
-            return
-        result = loader.poll()
-        if result is not None:
-            finish_preview(*result)
 
     def tick():
         if dragging:
@@ -1454,12 +1347,9 @@ def show_panel(resolve_app, fusion_app, bmd_app):
     clock_worker = Thread(target=queue_clock, name="NetEasePreviewClock", daemon=True)
 
     def preview_clock(_event):
-        nonlocal last_clock
         clock_pending.clear()
         if closing or current_thread() is clock_worker:
             return
-        last_clock = time.monotonic()
-        preview_ready()
         try:
             update_space_availability()
             try:
@@ -1667,6 +1557,8 @@ def show_panel(resolve_app, fusion_app, bmd_app):
 
     def preview_source(source):
         nonlocal loading_source
+        if loading_source is not None:
+            return
         try:
             if selected_folder() != listed_folder:
                 status("下载目录已更改，请先点「刷新列表」。")
@@ -1676,38 +1568,16 @@ def show_panel(resolve_app, fusion_app, bmd_app):
             stop_playback()
             loading_source = source
             set_track_title(source)
-            items["StopPreview"].Enabled = True
             seek.Enabled = False
             show_idle_frame()
             update_player_state()
-            volume = int(items["Volume"].Value)
-            if time.monotonic() - last_clock < 0.8:
-                loader.request(source, volume)
-            else:
-                # The panel can still play a track when its event pump is unavailable.
-                seek.Repaint()
-                prepared = AudioPreview()
-                prepared.volume = volume
-                prepared.prepare(source, Event())
-                finish_preview(prepared, None)
-        except Exception as exc:
-            stop_playback()
-            set_player_state("无法播放", "#ffd6d6", "#5c3339")
-            status("试听失败 · {}".format(exc))
-
-    def set_track_title(source):
-        track = source.name if len(source.name) <= 75 else source.name[:72] + "…"
-        items["PreviewTrack"].Text = track
-        items["PreviewTrack"].ToolTip = source.name
-
-    def finish_preview(prepared, error):
-        nonlocal loading_source, preview
-        loading_source = None
-        preview = prepared
-        try:
-            if error is not None:
-                raise RuntimeError(error)
+            status("正在准备试听…")
+            seek.Repaint()
+            preview.volume = int(items["Volume"].Value)
+            # Start from the user's UI event, independent of queued callbacks.
+            preview.prepare(source)
             preview.start_prepared()
+            loading_source = None
             show_idle_frame()
             player_resized(None)
             source = preview.source
@@ -1733,6 +1603,11 @@ def show_panel(resolve_app, fusion_app, bmd_app):
             stop_playback()
             set_player_state("无法播放", "#ffd6d6", "#5c3339")
             status("试听失败 · {}".format(exc))
+
+    def set_track_title(source):
+        track = source.name if len(source.name) <= 75 else source.name[:72] + "…"
+        items["PreviewTrack"].Text = track
+        items["PreviewTrack"].ToolTip = source.name
 
     def preview_selected(_event):
         selected = [path for row, path in rows if row.Selected]
@@ -1812,9 +1687,7 @@ def show_panel(resolve_app, fusion_app, bmd_app):
     def volume_changed(_event):
         volume = int(items["Volume"].Value)
         try:
-            if loading_source is not None:
-                preview_source(loading_source)
-            else:
+            if loading_source is None:
                 preview.set_volume(volume)
             items["VolumeLabel"].Text = "试听音量 {}%".format(volume)
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
@@ -2001,14 +1874,11 @@ def show_panel(resolve_app, fusion_app, bmd_app):
     window.On["ImportAB"].Clicked = import_segment
     window.On["OpenClient"].Clicked = open_client
     window.On["ClockPulse"].Clicked = preview_clock
-    window.On["PreviewReady"].Clicked = preview_ready
     items["ClockPulse"].Hide()
-    items["PreviewReady"].Hide()
     refresh()
     update_player_state()
     try:
         duration_worker.start()
-        loader.worker.start()
         window.Show()
         center_content()
         show_idle_frame()
@@ -2026,12 +1896,9 @@ def show_panel(resolve_app, fusion_app, bmd_app):
             window.Hide()
         finally:
             try:
-                loader.close()
+                preview.stop()
             finally:
-                try:
-                    preview.stop()
-                finally:
-                    artwork.cleanup()
+                artwork.cleanup()
 
 
 if __name__ == "__main__" or globals().get("bmd"):
