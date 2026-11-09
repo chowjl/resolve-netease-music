@@ -814,11 +814,10 @@ def save_preview_segment(preview, markers, output):
     return target
 
 
-def install_preview_shortcut(user32, title, can_toggle, toggle):
+def install_preview_shortcut(user32, title, allowed, requests):
+    # Give the hook its own Win32 message loop. Resolve's script dispatcher
+    # receives the playback request separately on its UI thread.
     hook_type = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
-    user32.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR]
-    user32.FindWindowExW.restype = wintypes.HWND
-    user32.IsWindowVisible.argtypes = [wintypes.HWND]
     user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
     user32.GetWindowThreadProcessId.restype = wintypes.DWORD
     user32.SetWindowsHookExW.argtypes = [ctypes.c_int, hook_type, wintypes.HINSTANCE, wintypes.DWORD]
@@ -826,53 +825,72 @@ def install_preview_shortcut(user32, title, can_toggle, toggle):
     user32.CallNextHookEx.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
     user32.CallNextHookEx.restype = ctypes.c_ssize_t
     user32.UnhookWindowsHookEx.argtypes = [wintypes.HANDLE]
+    message_ptr = ctypes.POINTER(wintypes.MSG)
+    user32.PeekMessageW.argtypes = [message_ptr, wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT]
+    user32.GetMessageW.argtypes = [message_ptr, wintypes.HWND, wintypes.UINT, wintypes.UINT]
+    user32.GetMessageW.restype = ctypes.c_int
+    user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    kernel32 = ctypes.WinDLL("kernel32.dll")
+    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 
-    hwnd = None
-    while True:
-        hwnd = user32.FindWindowExW(None, hwnd, None, title)
-        if not hwnd:
-            return None
-        owner = wintypes.DWORD()
-        thread_id = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
-        if thread_id and owner.value == os.getpid() and user32.IsWindowVisible(hwnd):
-            break
-
-    enabled = True
-    captured = False
+    ready = Event()
+    installed = Event()
+    stopping = Event()
+    process_id = os.getpid()
+    owner = wintypes.DWORD()
+    caption = ctypes.create_unicode_buffer(120)
+    space_down = captured = False
 
     @hook_type
-    def on_keyboard(code, key, flags):
-        nonlocal captured
-        if enabled and code == 0 and key == 0x20:
-            if captured and flags & (1 << 31):
-                captured = False
-                return 1
-            try:
-                if (not flags & (1 << 31) and user32.GetForegroundWindow() == hwnd
-                        and not any(user32.GetKeyState(modifier) & 0x8000 for modifier in (0x10, 0x11, 0x12))
-                        and can_toggle()):
-                    captured = True
-                    if not flags & (1 << 30):
-                        toggle(None)
+    def on_keyboard(code, message, data):
+        nonlocal space_down, captured
+        if code == 0 and data and ctypes.c_uint.from_address(data).value == 0x20:
+            if message in (0x0101, 0x0105):  # WM_KEYUP / WM_SYSKEYUP
+                space_down = False
+                if captured:
+                    captured = False
                     return 1
-            except Exception:
-                captured = False
-        return user32.CallNextHookEx(None, code, key, flags)
+            elif message == 0x0100:  # WM_KEYDOWN
+                if not space_down and allowed.is_set() and not stopping.is_set():
+                    hwnd = user32.GetForegroundWindow()
+                    if (hwnd and user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+                            and owner.value == process_id
+                            and user32.GetWindowTextW(hwnd, caption, len(caption))
+                            and caption.value == title
+                            and not any(user32.GetAsyncKeyState(key) & 0x8000 for key in (0x10, 0x11, 0x12))):
+                        captured = True
+                        requests.put(None)
+                space_down = True
+                if captured:
+                    return 1
+        return user32.CallNextHookEx(None, code, message, data)
 
-    # Keep the callback alive if Windows cannot remove the hook immediately.
-    hook = user32.SetWindowsHookExW(2, on_keyboard, None, thread_id)
-    if not hook:
+    def run_hook():
+        message = wintypes.MSG()
+        user32.PeekMessageW(ctypes.byref(message), None, 0, 0, 0)
+        hook = user32.SetWindowsHookExW(13, on_keyboard, kernel32.GetModuleHandleW(None), 0)
+        if hook:
+            installed.set()
+        ready.set()
+        if hook:
+            try:
+                while not stopping.is_set() and user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+                    pass
+            finally:
+                user32.UnhookWindowsHookEx(hook)
+
+    worker = Thread(target=run_hook, name="NetEasePreviewShortcut", daemon=True)
+    worker.start()
+    if not ready.wait(0.5) or not installed.is_set():
+        stopping.set()
+        user32.PostThreadMessageW(worker.native_id, 0x0012, 0, 0)  # WM_QUIT
         return None
-    registry = getattr(ctypes, "_netease_keyboard_hooks", None)
-    if registry is None:
-        registry = ctypes._netease_keyboard_hooks = {}
-    registry[hook] = on_keyboard
 
     def uninstall():
-        nonlocal enabled
-        enabled = False
-        if user32.UnhookWindowsHookEx(hook):
-            registry.pop(hook, None)
+        stopping.set()
+        user32.PostThreadMessageW(worker.native_id, 0x0012, 0, 0)
+        worker.join(0.5)
 
     return uninstall
 
@@ -1047,7 +1065,7 @@ def show_panel(resolve_app, fusion_app, bmd_app):
                     ui.Button({
                         "ID": "PausePreview", "Text": "播放 / 暂停", "FixedSize": [112, 34],
                         "Weight": 0, "Enabled": False, "ToolTip": "空格：暂停或继续试听",
-                        "StyleSheet": transport_style + 'QPushButton { qproperty-shortcut: "Space"; }',
+                        "StyleSheet": transport_style,
                     }),
                     ui.Button({"ID": "Ahead5", "Text": "+5 秒", "FixedSize": [69, 34], "Weight": 0, "Enabled": False, "StyleSheet": transport_style}),
                     ui.Button({"ID": "Next", "Text": "下一首", "FixedSize": [78, 34], "Weight": 0, "StyleSheet": transport_style}),
@@ -1127,6 +1145,8 @@ def show_panel(resolve_app, fusion_app, bmd_app):
     dragging = False
     closing = False
     remove_shortcut = None
+    space_allowed = Event()
+    space_requests = Queue()
     last_clock = 0.0
     clock_pending = Event()
 
@@ -1389,6 +1409,14 @@ def show_panel(resolve_app, fusion_app, bmd_app):
         clock_pending.clear()
         last_clock = time.monotonic()
         try:
+            update_space_availability()
+            try:
+                space_requests.get_nowait()
+            except Empty:
+                pass
+            else:
+                if space_allowed.is_set():
+                    play_or_toggle_with_space()
             tick()
         except Exception as exc:
             preview.playing = False
@@ -1642,7 +1670,6 @@ def show_panel(resolve_app, fusion_app, bmd_app):
             seek.Enabled = True
             items["LoadWaveform"].Enabled = True
             items["PausePreview"].Enabled = True
-            ensure_preview_shortcut()
             items["StopPreview"].Enabled = True
             items["Back5"].Enabled = True
             items["Ahead5"].Enabled = True
@@ -1700,19 +1727,21 @@ def show_panel(resolve_app, fusion_app, bmd_app):
         preview_source(source)
 
     def can_toggle_with_space():
-        return not closing and preview.opened and not any(
+        return not closing and loading_source is None and (preview.opened or bool(rows)) and not any(
             items[name].HasFocus() for name in ("Search", "Folder", "MP3Folder")
         )
 
-    def ensure_preview_shortcut():
-        nonlocal remove_shortcut
-        if remove_shortcut is None:
-            try:
-                remove_shortcut = install_preview_shortcut(
-                    user32, window_title, can_toggle_with_space, toggle_preview
-                )
-            except (AttributeError, OSError):
-                pass
+    def update_space_availability():
+        if can_toggle_with_space():
+            space_allowed.set()
+        else:
+            space_allowed.clear()
+
+    def play_or_toggle_with_space():
+        if preview.opened:
+            toggle_preview(None)
+        else:
+            play_from_track()
 
     def key_pressed(event):
         if event.get("IsAutoRepeat"):
@@ -1722,8 +1751,8 @@ def show_panel(resolve_app, fusion_app, bmd_app):
             return
         if event.get("Key") not in (32, "Space", "Key_Space") and event.get("Text") != " ":
             return
-        if can_toggle_with_space():
-            toggle_preview(event)
+        if remove_shortcut is None and can_toggle_with_space():
+            play_or_toggle_with_space()
 
     def volume_changed(_event):
         volume = int(items["Volume"].Value)
@@ -1925,6 +1954,8 @@ def show_panel(resolve_app, fusion_app, bmd_app):
         window.Show()
         center_content()
         show_idle_frame()
+        update_space_availability()
+        remove_shortcut = install_preview_shortcut(user32, window_title, space_allowed, space_requests)
         clock_worker.start()
         dispatcher.RunLoop()
     finally:
