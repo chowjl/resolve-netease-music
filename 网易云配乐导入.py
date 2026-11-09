@@ -814,12 +814,34 @@ def save_preview_segment(preview, markers, output):
     return target
 
 
-def install_preview_shortcut(user32, title, allowed, requests):
+def preview_owns_keyboard(user32, panel):
+    foreground = user32.GetForegroundWindow()
+    if not panel or not foreground:
+        return False
+    if user32.GetAncestor(foreground, 2) == panel:  # GA_ROOT
+        return True
+
+    # Resolve can keep its main window active while the pointer is over the
+    # floating panel. Qt may give that panel an owner or a separate top-level HWND.
+    pointer = wintypes.POINT()
+    if not user32.GetCursorPos(ctypes.byref(pointer)):
+        return False
+    hovered = user32.WindowFromPoint(pointer)
+    if not hovered or user32.GetAncestor(hovered, 2) != panel:
+        return False
+    if user32.GetAncestor(foreground, 3) == user32.GetAncestor(panel, 3):  # GA_ROOTOWNER
+        return True
+    foreground_process = wintypes.DWORD()
+    panel_process = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(foreground, ctypes.byref(foreground_process))
+    user32.GetWindowThreadProcessId(panel, ctypes.byref(panel_process))
+    return bool(panel_process.value and foreground_process.value == panel_process.value)
+
+
+def install_preview_shortcut(user32, panel_handle, allowed, requests):
     # Give the hook its own Win32 message loop. Resolve's script dispatcher
     # receives the playback request separately on its UI thread.
     hook_type = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
-    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
     user32.SetWindowsHookExW.argtypes = [ctypes.c_int, hook_type, wintypes.HINSTANCE, wintypes.DWORD]
     user32.SetWindowsHookExW.restype = wintypes.HANDLE
     user32.CallNextHookEx.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
@@ -837,9 +859,6 @@ def install_preview_shortcut(user32, title, allowed, requests):
     ready = Event()
     installed = Event()
     stopping = Event()
-    process_id = os.getpid()
-    owner = wintypes.DWORD()
-    caption = ctypes.create_unicode_buffer(120)
     space_down = captured = False
 
     @hook_type
@@ -853,11 +872,7 @@ def install_preview_shortcut(user32, title, allowed, requests):
                     return 1
             elif message == 0x0100:  # WM_KEYDOWN
                 if not space_down and allowed.is_set() and not stopping.is_set():
-                    hwnd = user32.GetForegroundWindow()
-                    if (hwnd and user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
-                            and owner.value == process_id
-                            and user32.GetWindowTextW(hwnd, caption, len(caption))
-                            and caption.value == title
+                    if (preview_owns_keyboard(user32, panel_handle())
                             and not any(user32.GetAsyncKeyState(key) & 0x8000 for key in (0x10, 0x11, 0x12))):
                         captured = True
                         requests.put(None)
@@ -1024,7 +1039,7 @@ def show_panel(resolve_app, fusion_app, bmd_app):
                     "ID": "Files", "ColumnCount": 5, "SelectionMode": "ExtendedSelection",
                     "SortingEnabled": False, "RootIsDecorated": False,
                     "AlternatingRowColors": True, "MinimumSize": [460, 96], "StyleSheet": tree_style,
-                    "Events": {"ItemDoubleClicked": True},
+                    "Events": {"ItemClicked": True, "ItemDoubleClicked": True},
                 }), weight=1),
                 aligned(ui.HGroup({"Spacing": 12}, [
                     ui.Label({
@@ -1145,6 +1160,7 @@ def show_panel(resolve_app, fusion_app, bmd_app):
     dragging = False
     closing = False
     remove_shortcut = None
+    panel_hwnd = None
     space_allowed = Event()
     space_requests = Queue()
     last_clock = 0.0
@@ -1335,7 +1351,16 @@ def show_panel(resolve_app, fusion_app, bmd_app):
             status("无法暂停或继续试听 · {}".format(exc))
 
     user32 = ctypes.WinDLL("user32.dll", use_last_error=True)
+    user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+    user32.FindWindowW.restype = wintypes.HWND
     user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetAncestor.restype = wintypes.HWND
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.WindowFromPoint.argtypes = [wintypes.POINT]
+    user32.WindowFromPoint.restype = wintypes.HWND
     user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
     user32.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
@@ -1344,6 +1369,14 @@ def show_panel(resolve_app, fusion_app, bmd_app):
     user32.GetAsyncKeyState.restype = ctypes.c_short
     user32.GetKeyState.argtypes = [ctypes.c_int]
     user32.GetKeyState.restype = ctypes.c_short
+
+    def focus_preview_panel(_event=None):
+        nonlocal panel_hwnd
+        panel_hwnd = user32.FindWindowW(None, window_title)
+        if panel_hwnd and user32.GetForegroundWindow() != panel_hwnd:
+            user32.SetForegroundWindow(panel_hwnd)
+        tree.SetFocus("MouseFocusReason")
+        update_space_availability()
 
     def first_coordinate(value, name):
         if isinstance(value, dict):
@@ -1685,6 +1718,7 @@ def show_panel(resolve_app, fusion_app, bmd_app):
     def preview_selected(_event):
         selected = [path for row, path in rows if row.Selected]
         if len(selected) == 1:
+            focus_preview_panel()
             preview_source(selected[0])
         else:
             status("试听时请选择一首音频。")
@@ -1727,7 +1761,7 @@ def show_panel(resolve_app, fusion_app, bmd_app):
         preview_source(source)
 
     def can_toggle_with_space():
-        return not closing and loading_source is None and (preview.opened or bool(rows)) and not any(
+        return not closing and (preview.opened or loading_source is not None or bool(rows)) and not any(
             items[name].HasFocus() for name in ("Search", "Folder", "MP3Folder")
         )
 
@@ -1738,6 +1772,8 @@ def show_panel(resolve_app, fusion_app, bmd_app):
             space_allowed.clear()
 
     def play_or_toggle_with_space():
+        if loading_source is not None:
+            return
         if preview.opened:
             toggle_preview(None)
         else:
@@ -1751,7 +1787,7 @@ def show_panel(resolve_app, fusion_app, bmd_app):
             return
         if event.get("Key") not in (32, "Space", "Key_Space") and event.get("Text") != " ":
             return
-        if remove_shortcut is None and can_toggle_with_space():
+        if can_toggle_with_space():
             play_or_toggle_with_space()
 
     def volume_changed(_event):
@@ -1923,6 +1959,7 @@ def show_panel(resolve_app, fusion_app, bmd_app):
     window.On["Import"].Clicked = import_selected
     window.On["Preview"].Clicked = preview_selected
     window.On["LoadWaveform"].Clicked = load_waveform
+    window.On["Files"].ItemClicked = focus_preview_panel
     window.On["Files"].ItemDoubleClicked = preview_double_clicked
     window.On["PausePreview"].Clicked = toggle_preview
     window.On["StopPreview"].Clicked = stop_preview
@@ -1954,8 +1991,8 @@ def show_panel(resolve_app, fusion_app, bmd_app):
         window.Show()
         center_content()
         show_idle_frame()
-        update_space_availability()
-        remove_shortcut = install_preview_shortcut(user32, window_title, space_allowed, space_requests)
+        focus_preview_panel()
+        remove_shortcut = install_preview_shortcut(user32, lambda: panel_hwnd, space_allowed, space_requests)
         clock_worker.start()
         dispatcher.RunLoop()
     finally:

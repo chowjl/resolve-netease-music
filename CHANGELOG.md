@@ -1,5 +1,10 @@
 # 更新日志
 
+## [v1.0.3](https://github.com/chowjl/resolve-netease-music/releases/tag/v1.0.3) · 2026-11-09
+
+- 打开试听面板、点击歌曲或开始试听时，将键盘焦点交给面板。
+- Windows 仍将达芬奇主窗口视为活动窗口时，鼠标位于试听面板上也可以用空格控制试听。
+
 ## [v1.0.2](https://github.com/chowjl/resolve-netease-music/releases/tag/v1.0.2) · 2026-11-09
 
 - 修正试听面板的空格键。面板有焦点时，按空格可开始试听、暂停或继续。长按只触发一次。
