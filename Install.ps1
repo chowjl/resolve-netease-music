@@ -13,12 +13,19 @@ if (!(Test-Path -LiteralPath $ffmpeg -PathType Leaf) -and
     $url = 'https://github.com/GyanD/codexffmpeg/releases/download/8.1.1/ffmpeg-8.1.1-essentials_build.zip'
     $expectedHash = '6F58CE889F59C311410F7D2B18895B33C03456463486F3B1EBC93D97A0F54541'
     $id = [guid]::NewGuid().ToString('N')
-    $archivePath = Join-Path ([IO.Path]::GetTempPath()) "resolve-netease-ffmpeg-$id.zip"
+    $localArchive = Join-Path $PSScriptRoot 'ffmpeg-8.1.1-essentials_build.zip'
+    $downloadPath = Join-Path ([IO.Path]::GetTempPath()) "resolve-netease-ffmpeg-$id.zip"
     $stagedExe = Join-Path $bin "ffmpeg-$id.tmp"
 
     try {
-        Write-Host 'Downloading FFmpeg 8.1.1 (about 100 MB)...'
-        Invoke-WebRequest -Uri $url -UseBasicParsing -OutFile $archivePath -TimeoutSec 600
+        if (Test-Path -LiteralPath $localArchive -PathType Leaf) {
+            Write-Host 'Using local FFmpeg archive. No download needed.'
+            $archivePath = $localArchive
+        } else {
+            Write-Host 'Downloading FFmpeg 8.1.1 (about 100 MB)...'
+            Invoke-WebRequest -Uri $url -UseBasicParsing -OutFile $downloadPath -TimeoutSec 600
+            $archivePath = $downloadPath
+        }
         $sha256 = [Security.Cryptography.SHA256]::Create()
         $stream = [IO.File]::OpenRead($archivePath)
         try {
@@ -45,9 +52,9 @@ if (!(Test-Path -LiteralPath $ffmpeg -PathType Leaf) -and
         }
         Move-Item -LiteralPath $stagedExe -Destination $ffmpeg -Force
     } catch {
-        throw "FFmpeg setup failed. Check your connection to GitHub, or put an existing ffmpeg.exe on PATH and try again. $($_.Exception.Message)"
+        throw "FFmpeg setup failed. Put the official ffmpeg-8.1.1-essentials_build.zip next to Install.cmd, or put an existing ffmpeg.exe on PATH and try again. $($_.Exception.Message)"
     } finally {
-        Remove-Item -LiteralPath $archivePath, $stagedExe -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $downloadPath, $stagedExe -ErrorAction SilentlyContinue
     }
 }
 

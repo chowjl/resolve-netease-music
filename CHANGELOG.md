@@ -1,5 +1,9 @@
 # 更新日志
 
+## [v1.0.6](https://github.com/chowjl/resolve-netease-music/releases/tag/v1.0.6) · 2026-11-09
+
+- 安装程序支持读取同目录下的 FFmpeg ZIP。可在目标电脑上离线完成安装，避开下载超时或 504。
+
 ## [v1.0.5](https://github.com/chowjl/resolve-netease-music/releases/tag/v1.0.5) · 2026-11-09
 
 - 双击歌曲时直接解码并启动试听，避免后台完成通知丢失后一直显示「准备中」。

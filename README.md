@@ -19,7 +19,7 @@
 面向 **Windows x64 和 DaVinci Resolve Studio 21.2**。搜索和下载歌曲需要 Windows 版网易云音乐客户端。
 
 1. 从 [Releases](https://github.com/chowjl/resolve-netease-music/releases/latest) 下载并完整解压 Windows 安装包，双击 `Install.cmd`。
-2. 等窗口显示 `Installed`，然后启动或重启达芬奇。若电脑上没有可用的 FFmpeg，安装程序会联网下载约 100 MB，并校验 SHA-256。
+2. 等窗口显示 `Installed`，然后启动或重启达芬奇。若电脑上没有可用的 FFmpeg，安装程序会使用同目录下的 FFmpeg ZIP，或联网下载约 100 MB，并校验 SHA-256。
 3. 打开一个项目，从 **工作区 → 脚本 → 网易云配乐导入** 进入面板。英文界面的菜单为 **Workspace → Scripts**。
 4. 首次打开时，选择网易云音乐客户端的下载目录，然后点「刷新列表」。
 
