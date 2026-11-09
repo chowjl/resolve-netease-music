@@ -28,6 +28,7 @@ from uuid import uuid4
 
 AUDIO_FORMATS = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".aif", ".aiff"}
 MUSIC_BIN_NAME = "网易云音乐"
+DEFAULT_MP3_FOLDER = "网易云配乐_MP3"
 PLAYHEAD_WIDTH = 30
 CONTENT_EDGE = 6
 WAVEFORM_ROW_HEIGHT = 88
@@ -88,18 +89,29 @@ def cloud_music_executable():
 
 def scan_audio(folder):
     files = []
-    for path in folder.iterdir():
-        suffix = path.suffix.lower()
-        if suffix not in AUDIO_FORMATS and suffix != ".ncm":
-            continue
-        try:
-            info = path.stat()
-            if not path.is_file() or not info.st_size:
+    def report_scan_error(error):
+        if error.filename == os.fspath(folder):
+            raise error
+
+    for directory, subfolders, filenames in folder.walk(on_error=report_scan_error):
+        subfolders[:] = [
+            name for name in subfolders
+            if name.casefold() != DEFAULT_MP3_FOLDER.casefold()
+            and not (directory / name).is_junction()
+        ]
+        for name in filenames:
+            path = directory / name
+            suffix = path.suffix.lower()
+            if suffix not in AUDIO_FORMATS and suffix != ".ncm":
                 continue
-        except OSError:
-            continue
-        files.append((info.st_mtime_ns, path))
-    files.sort(key=lambda entry: (-entry[0], entry[1].name.casefold()))
+            try:
+                info = path.stat()
+                if not path.is_file() or not info.st_size:
+                    continue
+            except OSError:
+                continue
+            files.append((info.st_mtime_ns, path))
+    files.sort(key=lambda entry: (-entry[0], entry[1].name.casefold(), str(entry[1]).casefold()))
     return files
 
 
@@ -305,7 +317,7 @@ def convert_ncm(source, output=None):
             digest.update(chunk)
 
     if output is None:
-        output = source.parent / "网易云配乐_MP3"
+        output = source.parent / DEFAULT_MP3_FOLDER
     output.mkdir(exist_ok=True)
     target = output / ("{} - {}.mp3".format(source.stem[:100], digest.hexdigest()[:16]))
     if target.is_file() and target.stat().st_size:
@@ -777,7 +789,7 @@ def save_preview_segment(preview, markers, output):
     if (info.st_size, info.st_mtime_ns) != preview.source_signature:
         raise RuntimeError("源文件在试听后有变化，请重新试听再导出。")
     start, end = markers
-    output = output or source.parent / "网易云配乐_MP3"
+    output = output or source.parent / DEFAULT_MP3_FOLDER
     output.mkdir(exist_ok=True)
     target = output / "{} - {}-{} - {}.mp3".format(
         source.stem[:84], start, end, file_digest(source)[:16]
