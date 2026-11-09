@@ -719,7 +719,8 @@ class AudioPreview:
 
 
 class PreviewLoader:
-    def __init__(self):
+    def __init__(self, on_ready):
+        self.on_ready = on_ready
         self.condition = Condition()
         self.pending = self.result = self.latest = None
         self.closed = False
@@ -776,7 +777,9 @@ class PreviewLoader:
                 accepted = not self.closed and not cancelled.is_set()
                 if accepted:
                     self.result = (prepared, error)
-            if not accepted:
+            if accepted:
+                self.on_ready()
+            else:
                 prepared.stop()
 
 
@@ -1113,6 +1116,7 @@ def show_panel(resolve_app, fusion_app, bmd_app):
                 ])),
                 ui.VGap(12, 0),
                 ui.Button({"ID": "ClockPulse", "Hidden": True, "Events": {"Clicked": True}}),
+                ui.Button({"ID": "PreviewReady", "Hidden": True, "Events": {"Clicked": True}}),
             ]),
             ui.Label({
                 "ID": "RightGutter", "Text": "", "MinimumSize": [44, 1],
@@ -1148,7 +1152,17 @@ def show_panel(resolve_app, fusion_app, bmd_app):
     duration_ffmpeg = find_ffmpeg()
     markers = [None, None]
     preview = AudioPreview()
-    loader = PreviewLoader()
+
+    def queue_preview_ready():
+        if end_worker.is_set():
+            return
+        try:
+            ui.QueueEvent(items["PreviewReady"], "Clicked", {})
+        except Exception:
+            # The playback clock can still pick up the completed result.
+            pass
+
+    loader = PreviewLoader(queue_preview_ready)
     loading_source = None
     seek = items["Seek"]
     displayed_position = 0
@@ -1273,12 +1287,16 @@ def show_panel(resolve_app, fusion_app, bmd_app):
         display_time(0)
         update_player_state()
 
-    def tick():
-        if dragging:
+    def preview_ready(_event=None):
+        if closing or current_thread() is loader.worker:
             return
         result = loader.poll()
         if result is not None:
             finish_preview(*result)
+
+    def tick():
+        if dragging:
+            return
         if waveform_needs_resize:
             if preview.opened:
                 show_waveform()
@@ -1431,16 +1449,17 @@ def show_panel(resolve_app, fusion_app, bmd_app):
                 try:
                     ui.QueueEvent(items["ClockPulse"], "Clicked", {})
                 except Exception:
-                    return
+                    clock_pending.clear()
 
     clock_worker = Thread(target=queue_clock, name="NetEasePreviewClock", daemon=True)
 
     def preview_clock(_event):
         nonlocal last_clock
+        clock_pending.clear()
         if closing or current_thread() is clock_worker:
             return
-        clock_pending.clear()
         last_clock = time.monotonic()
+        preview_ready()
         try:
             update_space_availability()
             try:
@@ -1982,7 +2001,9 @@ def show_panel(resolve_app, fusion_app, bmd_app):
     window.On["ImportAB"].Clicked = import_segment
     window.On["OpenClient"].Clicked = open_client
     window.On["ClockPulse"].Clicked = preview_clock
+    window.On["PreviewReady"].Clicked = preview_ready
     items["ClockPulse"].Hide()
+    items["PreviewReady"].Hide()
     refresh()
     update_player_state()
     try:

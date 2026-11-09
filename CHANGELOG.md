@@ -1,5 +1,9 @@
 # 更新日志
 
+## [v1.0.4](https://github.com/chowjl/resolve-netease-music/releases/tag/v1.0.4) · 2026-11-09
+
+- 双击歌曲试听时，后台解码完成后直接通知播放器启动。进度刷新也可以接收结果，避免界面长时间停在「准备中」。
+
 ## [v1.0.3](https://github.com/chowjl/resolve-netease-music/releases/tag/v1.0.3) · 2026-11-09
 
 - 打开试听面板、点击歌曲或开始试听时，将键盘焦点交给面板。
